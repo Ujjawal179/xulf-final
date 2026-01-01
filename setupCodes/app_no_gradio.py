@@ -309,7 +309,7 @@ def resize_bbox_to_dimensions(bbox, target_width, target_height, img_width, img_
     return [int(new_x1), int(new_y1), int(new_x2), int(new_y2)]
 
 
-def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yolo, batch_size, gpu_ids, overwrite, selected_class, save_as_png, sam2_prompt, debug_mode=False, skip_no_detection=False, padding_value=0, padding_unit="percent"):
+def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yolo, batch_size, gpu_ids, overwrite, selected_class, save_as_png, sam2_prompt, debug_mode=False, skip_no_detection=False, padding_value=0, padding_unit="percent", model_dir="model"):
     try:
         # Set global debug flag
         global debug
@@ -375,7 +375,7 @@ def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yo
                             selected_class, save_as_png, sam2_prompt, results_queue,
                             processed_files_queue, processed_count, stop_processing,
                             status_queue, big_lock, debug_mode, skip_no_detection,
-                            padding_value, padding_unit
+                            padding_value, padding_unit, model_dir
                         )
                     )
                     p.start()
@@ -897,9 +897,9 @@ def resize_image(args):
         logging.critical(f"Error processing {input_path}: {e}")
         return 0, 0
 
-def resize_images(input_folder, output_folder, resolutions, save_as_png, num_threads=1, overwrite=False, no_crop=False):
+def resize_images(Model_Dir, input_folder, output_folder, resolutions, save_as_png, num_threads=1, overwrite=False, no_crop=False):
     resolutions = [tuple(map(int, res.strip().split('x'))) for res in resolutions.split(',')]
-    face_model_path = "models/face_yolov9c.pt"
+    face_model_path = os.path.join(Model_Dir, "face_yolov9c.pt")
 
     image_paths = []
     for resolution in resolutions:
@@ -1080,8 +1080,10 @@ def process_image_face(args):
             os.remove(png_path)
         return f"Error processing {input_path}: {e}", 0, 0
 
-def extract_faces(input_folder, output_folder, padding, save_as_png, num_threads):
-    face_model = YOLO("models/face_yolov9c.pt")
+def extract_faces(Model_Dir, input_folder, output_folder, padding, save_as_png, num_threads):
+    
+    face_model_path = os.path.join(Model_Dir, "face_yolov9c.pt")
+    face_model = YOLO(face_model_path)
 
     image_paths = [os.path.join(input_folder, fname) for fname in os.listdir(input_folder) if fname.lower().endswith(img_formats)]
     total_images = len(image_paths)
@@ -1526,13 +1528,15 @@ def initialize_sam2_models(device):
     except Exception as e:
         raise Exception(f"Failed to initialize SAM2 models: {str(e)}")
 
-def initialize_yolo_models(device, selected_class="yolov11l-face.pt"):
+def initialize_yolo_models(model_dir, device, selected_class="yolov11l-face.pt"):
     try:
         # Use specific face model if selected
         if selected_class == "yolov11l-face.pt":
-            model = YOLO("models/yolov11l-face.pt")
+            model_path = os.path.join(model_dir, "yolov11l-face.pt")
+            model = YOLO(model_path)
         else:
-            model = YOLO("models/yolo11x.pt")
+            model_path = os.path.join(model_dir, "yolo11x.pt")
+            model = YOLO(model_path)
         model.to(device)
         return {'yolo_model': model}
     except Exception as e:
@@ -1598,7 +1602,7 @@ def worker_process(gpu_id, worker_id, tasks, input_folder, output_folder, yolo_f
                   aspect_ratios, save_yolo, overwrite, selected_class, save_as_png, 
                   sam2_prompt, results_queue, processed_files_queue, processed_count, 
                   stop_processing, status_queue, big_lock, debug_mode, skip_no_detection,
-                  padding_value, padding_unit):
+                  padding_value, padding_unit, model_dir):
 
     try:
         global debug
@@ -1617,7 +1621,7 @@ def worker_process(gpu_id, worker_id, tasks, input_folder, output_folder, yolo_f
             if sam2_prompt:
                 models = initialize_sam2_models(device)
             else:
-                models = initialize_yolo_models(device, selected_class)
+                models = initialize_yolo_models(model_dir, device, selected_class)
         except Exception as e:
             status_queue.put(f"ERROR:Failed to initialize models on GPU {gpu_id}: {str(e)}")
             return
@@ -1878,7 +1882,7 @@ def process_image_face_enhanced(args):
     """
     Enhanced face extraction function that supports both YOLO and SAM2 detection methods.
     """
-    input_path, output_root, padding, save_as_png, selected_class, sam2_prompt, device, debug_mode = args
+    input_path, output_root, padding, save_as_png, selected_class, sam2_prompt, device, debug_mode, model_dir = args
     
     try:
         debug = debug_mode
@@ -1896,7 +1900,7 @@ def process_image_face_enhanced(args):
         else:
             if debug:
                 logging.critical("Initializing YOLO models in worker process...")
-            models = initialize_yolo_models(device, selected_class)
+            models = initialize_yolo_models(model_dir, device, selected_class)
             yolo_model = models.get('yolo_model')
             sam2_predictor = None
             grounding_model = None
@@ -1950,7 +1954,7 @@ def process_image_face_enhanced(args):
             logging.critical(f"Error processing {input_path}: {str(e)}")
         return f"Error processing {os.path.basename(input_path)}: {str(e)}", 0, 1
 
-def extract_faces_enhanced(input_folder, output_folder, padding, save_as_png, num_threads, selected_class, sam2_prompt, device="cuda:0", debug_mode=False):
+def extract_faces_enhanced(input_folder, output_folder, padding, save_as_png, num_threads, selected_class, sam2_prompt, device="cuda:0", debug_mode=False, model_dir="model"):
     """
     Enhanced face extraction function that supports both YOLO and SAM2 detection methods.
     """
@@ -1992,7 +1996,7 @@ def extract_faces_enhanced(input_folder, output_folder, padding, save_as_png, nu
             futures = [
                 executor.submit(
                     process_image_face_enhanced,
-                    (path, output_folder, padding, save_as_png, selected_class, sam2_prompt, device, debug_mode)
+                    (path, output_folder, padding, save_as_png, selected_class, sam2_prompt, device, debug_mode, model_dir)
                 )
                 for path in image_paths
             ]
@@ -2067,6 +2071,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Image processing CLI (crop/resize/etc) - Gradio removed"
     )
+    parser.add_argument("--model-dir", default="model", help="Directory containing model files (default: model)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # --- crop ---
@@ -2148,15 +2153,17 @@ def main():
             args.png,
             args.sam2_prompt,
             debug_mode=args.debug,
-            skip_no_detection=args.skip_no_detection,
+            skip_no_detection=args.skip_no_detection,  
             padding_value=args.padding_value,
             padding_unit=args.padding_unit,
+            model_dir=args.model_dir,
         )
         _print_generator(gen)
         return
 
     if args.cmd == "resize":
         gen = resize_images(
+            args.model_dir,
             args.input,
             args.output,
             args.resolutions,
@@ -2192,6 +2199,7 @@ def main():
             args.sam2_prompt,
             args.gpu_id,
             args.debug,
+            model_dir=args.model_dir,
         )
         _print_generator(gen)
         return
