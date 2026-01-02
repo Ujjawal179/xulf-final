@@ -804,8 +804,8 @@ def resize_image(args):
         face_locations = None
 
         for resolution in resolutions:
-            subfolder_name = f"{resolution[0]}x{resolution[1]}"
-            output_folder = os.path.join(output_root, subfolder_name)
+            # Use output_root directly without subfolders
+            output_folder = output_root
             os.makedirs(output_folder, exist_ok=True)
 
             output_filename = os.path.basename(input_path)
