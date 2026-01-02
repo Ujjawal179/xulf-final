@@ -17,13 +17,12 @@ import json
 from pathlib import Path
 import numpy as np
 from io import StringIO, BytesIO
-import torch  # Add this line
+import torch  
 import multiprocessing
 from multiprocessing import Process, Queue, Value, Lock, Manager
 import threading
 import sys
 
-# Configure logging once at the start of your program
 logging.basicConfig(
     level=logging.ERROR,
     format='%(message)s',
@@ -50,7 +49,6 @@ class ProcessingState:
         self.current_executor = executor
         
     def stop_processing(self):
-        # Set both the threading event and manager flag
         self.cancel_event.set()
         if self.stop_flag is not None:
             try:
@@ -58,7 +56,6 @@ class ProcessingState:
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
         
-        # Also try to shutdown the executor
         if self.current_executor is not None:
             try:
                 self.current_executor.shutdown(wait=False, cancel_futures=True)
@@ -66,11 +63,9 @@ class ProcessingState:
                 pass
     
     def is_cancelled(self):
-        # Check threading event first (most reliable)
         if self.cancel_event.is_set():
             return True
         
-        # Fallback to manager flag if available
         if self.stop_flag is not None:
             try:
                 return self.stop_flag.value
@@ -80,7 +75,6 @@ class ProcessingState:
         return False
     
     def reset(self):
-        # Reset for new processing
         self.cancel_event.clear()
         self.current_executor = None
         if self.stop_flag is not None:
@@ -89,10 +83,8 @@ class ProcessingState:
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
-# Create global instance
 processing_state = ProcessingState()
 
-# Make sure these imports work with your environment
 try:
     multiprocessing.set_start_method('spawn')
 except RuntimeError:
@@ -107,7 +99,6 @@ debug = False
 
 import os
 
-# Import SAM2 functions (NO path assumptions here)
 from .SAM_Segmenter_final import (
     build_sam2,
     SAM2ImagePredictor,
@@ -188,18 +179,15 @@ def filter_existing_files(image_files, output_folder, aspect_ratios, save_yolo, 
     files_to_process = []
     skipped_files = []
     
-    # Parse aspect ratios
     aspect_ratio_list = parse_aspect_ratio_tuples(aspect_ratios)
     
     for filename in image_files:
         base_name = os.path.splitext(filename)[0]
         extension = '.png' if save_as_png else '.jpg'
         
-        # Track which aspect ratios exist for this file
         existing_aspects = []
         missing_aspects = []
         
-        # Check each aspect ratio folder
         for target_width, target_height in aspect_ratio_list:
             aspect_folder = os.path.join(output_folder, f"{target_width}x{target_height}")
             output_path = os.path.join(aspect_folder, base_name + extension)
@@ -209,14 +197,12 @@ def filter_existing_files(image_files, output_folder, aspect_ratios, save_yolo, 
             else:
                 missing_aspects.append(f"{target_width}x{target_height}")
         
-        # Check YOLO/SAM2 folder if enabled
         yolo_exists = False
         if save_yolo and yolo_folder:
             yolo_path = os.path.join(yolo_folder, base_name + extension)
             if os.path.exists(yolo_path):
                 yolo_exists = True
         
-        # If file needs processing for any aspect ratio, add it
         if missing_aspects:
             files_to_process.append(filename)
             if existing_aspects:
@@ -239,7 +225,6 @@ def draw_debug_bbox(image, bbox, output_path):
                  (int(bbox[2]), int(bbox[3])), 
                  (0, 255, 0), 2)
     
-    # Draw center point
     center_x = (bbox[0] + bbox[2]) // 2
     center_y = (bbox[1] + bbox[3]) // 2
     cv2.circle(img_debug, (int(center_x), int(center_y)), 5, (0, 0, 255), -1)
@@ -253,13 +238,10 @@ def save_bounded_region(image, bbox, output_path):
         
     os.makedirs("debug_bounding_box", exist_ok=True)
     
-    # Convert bbox coordinates to integers
     x1, y1, x2, y2 = map(int, bbox)
     
-    # Extract the bounded region
     bounded_region = image[y1:y2, x1:x2]
     
-    # Save the bounded region
     cv2.imwrite(os.path.join("debug_bounding_box", output_path), cv2.cvtColor(bounded_region, cv2.COLOR_RGB2BGR))
 
 def resize_bbox_to_dimensions(bbox, target_width, target_height, img_width, img_height, is_sam=False, padding_value=0, padding_unit="percent"):
@@ -270,7 +252,6 @@ def resize_bbox_to_dimensions(bbox, target_width, target_height, img_width, img_
     subject_width = x2 - x1
     subject_height = y2 - y1
     
-    # Calculate centers
     center_x = (x1 + x2) / 2
     center_y = (y1 + y2) / 2
     
@@ -283,27 +264,21 @@ def resize_bbox_to_dimensions(bbox, target_width, target_height, img_width, img_
         print(f"Target aspect: {target_aspect:.3f}")
         print(f"Current aspect: {current_aspect:.3f}")
     
-    # Determine if we need to expand width or height
     if current_aspect > target_aspect:
-        # Too wide - increase height
         new_width = subject_width
         new_height = new_width / target_aspect
     else:
-        # Too tall - increase width
         new_height = subject_height
         new_width = new_height * target_aspect
     
-    # Calculate padding while maintaining center
     padding_x = (new_width - subject_width) / 2
     padding_y = (new_height - subject_height) / 2
     
-    # Apply padding if specified
     if padding_value > 0:
         if padding_unit == "percent":
-            # Apply percentage padding
             padding_x_val = new_width * (padding_value / 100)
             padding_y_val = new_height * (padding_value / 100)
-        else:  # pixel padding
+        else: 
             padding_x_val = padding_value
             padding_y_val = padding_value
             
@@ -313,13 +288,11 @@ def resize_bbox_to_dimensions(bbox, target_width, target_height, img_width, img_
         if debug:
             print(f"Applied {padding_value}{padding_unit} padding: width+{2*padding_x_val:.1f}, height+{2*padding_y_val:.1f}")
     
-    # Calculate new coordinates from center
     new_x1 = center_x - (new_width / 2)
     new_y1 = center_y - (new_height / 2)
     new_x2 = center_x + (new_width / 2)
     new_y2 = center_y + (new_height / 2)
     
-    # Handle boundary cases
     if new_x1 < 0:
         new_x2 += abs(new_x1)
         new_x1 = 0
@@ -333,7 +306,6 @@ def resize_bbox_to_dimensions(bbox, target_width, target_height, img_width, img_
         new_y1 -= (new_y2 - img_height)
         new_y2 = img_height
         
-    # Final boundary check
     new_x1 = max(0, new_x1)
     new_y1 = max(0, new_y1)
     new_x2 = min(img_width, new_x2)
@@ -347,7 +319,6 @@ def resize_bbox_to_dimensions(bbox, target_width, target_height, img_width, img_
 
 def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yolo, batch_size, gpu_ids, overwrite, selected_class, save_as_png, sam2_prompt, debug_mode=False, skip_no_detection=False, padding_value=0, padding_unit="percent", model_dir="models"):
     try:
-        # Set global debug flag
         global debug
         debug = debug_mode
         
@@ -363,7 +334,6 @@ def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yo
         status_queue = manager.Queue()
         big_lock = manager.Lock()
 
-        # Get image files and filter existing ones
         image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(img_formats)]
         
         # Filter out existing files and get skip information
@@ -377,7 +347,6 @@ def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yo
             overwrite
         )
         
-        # Report skipped files
         if skipped_files:
             yield f"Skipping {len(skipped_files)} existing files:"
             for skip_info in skipped_files:
@@ -389,10 +358,8 @@ def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yo
             
         yield f"Processing {len(filtered_files)} new files..."
         
-        # Process GPU IDs
         gpu_ids = [int(x.strip()) for x in gpu_ids.split(',')]
         
-        # Distribute filtered tasks
         tasks_per_gpu = distribute_tasks(filtered_files, gpu_ids, batch_size)
 
         processes = []
@@ -400,7 +367,7 @@ def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yo
         try:
             for gpu_index, gpu_id in enumerate(gpu_ids):
                 for worker_index, tasks in enumerate(tasks_per_gpu[gpu_index]):
-                    if not tasks:  # Skip if no tasks for this worker
+                    if not tasks:
                         continue
                     worker_id = gpu_index * batch_size + worker_index
                     p = Process(
@@ -417,13 +384,12 @@ def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yo
                     p.start()
                     processes.append(p)
 
-            # Monitor progress
             total_files = len(image_files)
             while processed_count.value < total_files and any(p.is_alive() for p in processes):
                 if stop_processing.value:
-                    # Wait for processes to finish current tasks
+                    # Wait for processes to finish current tasks (5sec)
                     for p in processes:
-                        p.join(timeout=5)  # Give processes 5 seconds to finish
+                        p.join(timeout=5) 
                     yield "Processing stopped by user"
                     break
                 
@@ -437,14 +403,12 @@ def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yo
             yield return_message
 
         finally:
-            # Clean up processes
-            stop_processing.value = True  # Set stop flag
+            stop_processing.value = True  
             for p in processes:
                 if p.is_alive():
                     p.terminate()
                 p.join(timeout=1)
             
-            # Clean up manager
             manager.shutdown()
 
     except Exception as e:
@@ -485,7 +449,7 @@ def try_reach_aspect_ratio(bbox, target_aspect, original_width, original_height,
                 new_bbox[0] -= 1
             if new_bbox[2] < original_width:
                 new_bbox[2] += 1
-        else:  # height
+        else:  
             if new_bbox[1] > 0:
                 new_bbox[1] -= 1
             if new_bbox[3] < original_height:
@@ -509,33 +473,28 @@ def try_reach_aspect_ratio(bbox, target_aspect, original_width, original_height,
             diff_percentage = aspect_ratio_diff_percentage(current_aspect, target_aspect)
             match_percentage = 100 - diff_percentage
             
-            # Update best result if this is better
             if match_percentage > best_percentage:
                 best_bbox = list(current_bbox)
                 best_percentage = match_percentage
 
-            # Check if we've reached our target percentage
             if match_percentage >= current_target_percentage:
                 return True, current_bbox, match_percentage
 
-            # Determine expansion direction
             if current_aspect < target_aspect:
-                # Too tall, need to expand width
+                
                 current_bbox = expand_bbox_by_one(current_bbox, 'width')
             else:
-                # Too wide, need to expand height
                 current_bbox = expand_bbox_by_one(current_bbox, 'height')
             
             iteration += 1
             
-            # Check if we can't expand anymore
             width = current_bbox[2] - current_bbox[0]
             height = current_bbox[3] - current_bbox[1]
             if (width >= original_width and current_aspect < target_aspect) or \
                (height >= original_height and current_aspect > target_aspect):
                 break
 
-        # Reduce target percentage and try again
+        
         current_target_percentage -= 1
         
     return False, best_bbox, best_percentage
@@ -543,7 +502,6 @@ def try_reach_aspect_ratio(bbox, target_aspect, original_width, original_height,
 def process_image(args):
     filename, input_folder, output_folder, aspect_ratios, yolo_folder, save_yolo, overwrite, selected_class, save_as_png, sam2_prompt, model, sam2_predictor, grounding_model, debug_mode, skip_no_detection, padding_value, padding_unit = args
     
-    # Set debug flag at the start of the function
     debug = debug_mode
     def parse_aspect_ratios(aspect_ratios):
         """Helper function to parse aspect ratios from different input formats"""
@@ -571,16 +529,12 @@ def process_image(args):
             
             img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
             
-            # Convert to JPG first if save_as_png is False
             if not save_as_png:
                 if debug:
                     logging.critical(f"Converting {filename} to JPG format before processing")
                 
-                # Load original image with PIL to properly handle transparency
                 with Image.open(img_path) as original_pil:
-                    # Convert to RGB and handle transparency by adding white background
                     if original_pil.mode in ('RGBA', 'LA', 'P'):
-                        # Create white background
                         background = Image.new('RGB', original_pil.size, (255, 255, 255))
                         if original_pil.mode == 'P':
                             original_pil = original_pil.convert('RGBA')
@@ -590,12 +544,11 @@ def process_image(args):
                     else:
                         pil_img = original_pil.convert('RGB')
                     
-                    # Create a temporary JPG version in memory
                     jpg_buffer = BytesIO()
                     pil_img.save(jpg_buffer, format='JPEG', quality=100)
                     jpg_buffer.seek(0)
                     
-                    # Reload the JPG image and convert to numpy array
+                    # Reload the temp JPG
                     pil_img_jpg = Image.open(jpg_buffer)
                     img_array = np.array(pil_img_jpg)
                 
@@ -606,7 +559,7 @@ def process_image(args):
             if debug:
                 logging.critical(f"1. Original image size: {original_width}x{original_height}")
 
-            # SAM2 Processing
+            # SAM2 Processing starts here
             if sam2_prompt:
                 if debug:
                     logging.critical("\n=== SAM2 Processing ===")
@@ -647,7 +600,6 @@ def process_image(args):
                             logging.critical(f"Mask coordinates format: {type(mask_coordinates)}, sample: {mask_coordinates[:3] if mask_coordinates else 'Empty'}")
                         return f"Invalid coordinate format for {filename}", 0, 1
                     
-                    # Validate coordinates
                     if len(x_coords) == 0 or len(y_coords) == 0:
                         if debug:
                             logging.critical("Empty coordinate arrays")
@@ -656,13 +608,11 @@ def process_image(args):
                     bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
                     bbox = [int(x) for x in bbox]
                     
-                    # Validate bbox dimensions
                     if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
                         if debug:
                             logging.critical(f"Invalid bbox dimensions: {bbox}")
                         return f"Invalid bbox for {filename}", 0, 1
                     
-                    # Ensure bbox is within image bounds
                     bbox[0] = max(0, bbox[0])
                     bbox[1] = max(0, bbox[1])
                     bbox[2] = min(original_width, bbox[2])
@@ -686,7 +636,6 @@ def process_image(args):
                 results = model(img_array)
                 detections = results[0].boxes
                 
-                # Debug: show what classes are actually detected and available
                 if detections is not None and len(detections) > 0:
                     detected_classes = [model.names[int(box.cls)] for box in detections]
                     print(f"DETECTED CLASSES: {detected_classes}")
@@ -695,9 +644,7 @@ def process_image(args):
                 
                 class_detections = [box for box in detections if model.names[int(box.cls)] == selected_class]
                 
-                # If no exact match, try finding 'face' class or use first detection for face models
                 if not class_detections and detections is not None and len(detections) > 0:
-                    # Check if this is a face-specific model (like yolov11l-face.pt)
                     face_classes = [box for box in detections if 'face' in model.names[int(box.cls)].lower()]
                     if face_classes:
                         class_detections = face_classes
@@ -1755,51 +1702,23 @@ def print_task_distribution(tasks_per_gpu, gpu_ids):
 def cancel_tiled_handler():
     processing_state.stop_processing()
     time.sleep(1)
-    return "⚠️ Tiled Image generation cancelled."
+    return "Tiled Image generation cancelled."
 
 def cancel_resizer_handler():
     processing_state.stop_processing()
     time.sleep(1)
-    return "⚠️ Image resizing cancelled."
+    return "Image resizing cancelled."
 
 def cancel_faces_handler():
     processing_state.stop_processing()
     time.sleep(1)
-    return "⚠️ Face extraction cancelled."
+    return "Face extraction cancelled."
 
 def cancel_duplicates_handler():
     processing_state.stop_processing()
     time.sleep(1)
-    return "⚠️ Duplicate detection cancelled."
+    return "Duplicate detection cancelled."
 
-# def process_single_image_process(image_path, input_folder, output_folder, yolo_folder, 
-#                                  aspect_ratios, save_yolo, overwrite, selected_class,
-#                                  save_as_png, sam2_prompt, models, device, debug_mode, skip_no_detection=False):
-#     try:
-#         filename = os.path.basename(image_path)
-#         aspect_ratios = parse_aspect_ratio_tuples(aspect_ratios)
-        
-#         if sam2_prompt:
-#             sam2_predictor = models['sam2_predictor']
-#             grounding_model = models['grounding_model']
-#             result = process_image((
-#                 filename, input_folder, output_folder, aspect_ratios,
-#                 yolo_folder, save_yolo, overwrite, selected_class,
-#                 save_as_png, sam2_prompt, None, sam2_predictor, grounding_model, debug_mode, skip_no_detection,
-#                 padding_value, padding_unit
-#             ))
-#         else:
-#             yolo_model = models['yolo_model']
-#             result = process_image((
-#                 filename, input_folder, output_folder, aspect_ratios,
-#                 yolo_folder, save_yolo, overwrite, selected_class,
-#                 save_as_png, None, yolo_model, None, None, debug_mode, skip_no_detection,
-#                 padding_value, padding_unit
-#             ))
-        
-#         return result
-#     except Exception as e:
-#         raise Exception(f"Error processing {image_path}: {str(e)}")
 
 def detect_face_or_object(img_array, selected_class, sam2_prompt, model, sam2_predictor, grounding_model, debug_mode=False):
     """
