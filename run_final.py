@@ -1,16 +1,17 @@
 """
-run_preprocess.py
+run_final.py
 
-To Dos:
+Pipeline:
 0) Clone Repo, cd into it, run this script with necessary args
 1) Download + unzip dataset
 2) Find the folder that actually contains images (handles "Akanksha/" nested inside the zip)
 3) Crop to the requested aspect ratio(s) using newCodes.app_no_gradio.crop_images
    IMPORTANT: crop_images is a GENERATOR 
 4) Resize the cropped Images using newCodes.app_no_gradio.resize_images (also a GENERATOR)
-
 5) Resolve toml file
 6) Launch kohya training using the resolved toml file
+7) Upload trained model to R2 storage
+8) Call webhook on completion/failure
 """
 
 import argparse
@@ -19,8 +20,30 @@ import os
 import zipfile
 import urllib.request
 import subprocess
+import json
+import hashlib
+import hmac
 from pathlib import Path
-import sys
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+# R2/S3 upload
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+    HAS_BOTO = True
+except ImportError:
+    HAS_BOTO = False
+    print("Warning: boto3 not installed, R2 upload will be skipped")
+
+# HTTP requests for webhook
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+    # Fallback to urllib
+    import urllib.request as urllib_req
 
 from newCodes.app_final import crop_images, resize_images
 
@@ -31,8 +54,219 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
+# Also log to console
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(console_handler)
+
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 
+
+# ============== R2 Upload Functions ==============
+
+def get_r2_client():
+    """Create R2/S3 client from environment variables."""
+    if not HAS_BOTO:
+        return None
+    
+    endpoint = os.environ.get("R2_ENDPOINT")
+    access_key = os.environ.get("R2_ACCESS_KEY_ID")
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY")
+    
+    if not all([endpoint, access_key, secret_key]):
+        logging.warning("R2 credentials not fully configured, skipping R2 upload")
+        return None
+    
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=BotoConfig(
+            signature_version="s3v4",
+            retries={"max_attempts": 3, "mode": "adaptive"},
+        ),
+    )
+
+
+def upload_to_r2(local_path: Path, r2_key: str) -> Optional[str]:
+    """
+    Upload a file to R2 storage.
+    Returns the public URL if successful, None otherwise.
+    """
+    client = get_r2_client()
+    if not client:
+        return None
+    
+    bucket = os.environ.get("R2_BUCKET")
+    public_base = os.environ.get("R2_PUBLIC_BASE", "").rstrip("/")
+    
+    if not bucket:
+        logging.error("R2_BUCKET not set")
+        return None
+    
+    try:
+        logging.info(f"Uploading {local_path} to R2: {r2_key}")
+        
+        # Determine content type
+        suffix = local_path.suffix.lower()
+        content_type = {
+            ".safetensors": "application/octet-stream",
+            ".bin": "application/octet-stream",
+            ".json": "application/json",
+            ".txt": "text/plain",
+            ".log": "text/plain",
+        }.get(suffix, "application/octet-stream")
+        
+        client.upload_file(
+            str(local_path),
+            bucket,
+            r2_key,
+            ExtraArgs={"ContentType": content_type},
+        )
+        
+        public_url = f"{public_base}/{r2_key}" if public_base else None
+        logging.info(f"Uploaded to R2: {r2_key}")
+        if public_url:
+            logging.info(f"Public URL: {public_url}")
+        
+        return public_url
+    except Exception as e:
+        logging.error(f"R2 upload failed: {e}")
+        return None
+
+
+def upload_training_outputs(saves_dir: Path, r2_out_key: str) -> Dict[str, Optional[str]]:
+    """
+    Upload all training outputs to R2.
+    Returns dict of {filename: public_url}.
+    """
+    results = {}
+    
+    if not saves_dir.exists():
+        logging.warning(f"Saves directory does not exist: {saves_dir}")
+        return results
+    
+    # Find all safetensors and related files
+    for pattern in ["*.safetensors", "*.json", "*.txt", "*.log"]:
+        for file_path in saves_dir.glob(pattern):
+            # Build R2 key - use the r2_out_key as base path
+            r2_base = r2_out_key.rsplit("/", 1)[0] if "/" in r2_out_key else "lora"
+            r2_key = f"{r2_base}/{file_path.name}"
+            
+            url = upload_to_r2(file_path, r2_key)
+            results[file_path.name] = url
+    
+    # Also look for the main model file specifically
+    main_model_patterns = ["*.safetensors"]
+    for pattern in main_model_patterns:
+        for file_path in saves_dir.glob(f"**/{pattern}"):
+            if file_path.name not in results:
+                r2_base = r2_out_key.rsplit("/", 1)[0] if "/" in r2_out_key else "lora"
+                r2_key = f"{r2_base}/{file_path.name}"
+                url = upload_to_r2(file_path, r2_key)
+                results[file_path.name] = url
+    
+    return results
+
+
+# ============== Webhook Functions ==============
+
+def sign_webhook_payload(payload: str, secret: str) -> str:
+    """Generate HMAC-SHA256 signature for webhook payload."""
+    return hmac.new(
+        secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def call_webhook(
+    webhook_url: str,
+    status: str,
+    job_id: str,
+    model_id: str = "",
+    user_id: str = "",
+    lora_url: Optional[str] = None,
+    error_message: Optional[str] = None,
+    extra_data: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Call the webhook endpoint with job status.
+    Returns True if successful, False otherwise.
+    """
+    if not webhook_url:
+        logging.warning("No webhook URL configured, skipping callback")
+        return False
+    
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
+    
+    payload = {
+        "status": status,  # "completed", "failed", "error"
+        "request_id": job_id,
+        "job_id": job_id,
+        "model_id": model_id,
+        "user_id": user_id,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "source": "azure_ml",
+    }
+    
+    if lora_url:
+        payload["lora_url"] = lora_url
+        # Also include in result format expected by existing webhook handler
+        payload["result"] = {
+            "diffusers_lora_file": {"url": lora_url},
+        }
+    
+    if error_message:
+        payload["error"] = error_message
+    
+    if extra_data:
+        payload.update(extra_data)
+    
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    if webhook_secret:
+        signature = sign_webhook_payload(payload_json, webhook_secret)
+        headers["X-Webhook-Signature"] = signature
+        headers["X-Fal-Signature"] = signature  # Compatibility with existing handler
+    
+    try:
+        logging.info(f"Calling webhook: {webhook_url}")
+        logging.info(f"Payload: {payload_json[:500]}...")
+        
+        if HAS_REQUESTS:
+            resp = requests.post(
+                webhook_url,
+                data=payload_json,
+                headers=headers,
+                timeout=30,
+            )
+            success = resp.status_code < 400
+            logging.info(f"Webhook response: {resp.status_code} {resp.text[:200]}")
+        else:
+            # Fallback to urllib
+            req = urllib_req.Request(
+                webhook_url,
+                data=payload_json.encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib_req.urlopen(req, timeout=30) as resp:
+                success = resp.status < 400
+                logging.info(f"Webhook response: {resp.status}")
+        
+        return success
+    except Exception as e:
+        logging.error(f"Webhook call failed: {e}")
+        return False
+
+
+# ============== Original Pipeline Functions ==============
 
 def download_zip(url: str, zip_path: Path) -> None:
     zip_path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +304,8 @@ def consume_generator(gen) -> None:
     for msg in gen:
         logging.info("%s", msg)
 
-def run(cmd, check=True):
+
+def run_cmd(cmd, check=True):
     print("\n>>>", " ".join(cmd))
     subprocess.run(cmd, check=check)
 
@@ -89,6 +324,14 @@ def main() -> None:
     parser.add_argument("--saves_dir", required=True, help="Azure output: model save directory")
     parser.add_argument("--config", default="setupCodes/runConfig.toml", help="Base TOML config")
 
+    # R2 and webhook arguments (passed from Azure job env or command line)
+    parser.add_argument("--r2_out_key", type=str, default="", help="R2 key for output model (e.g. lora/user/model/model.safetensors)")
+    parser.add_argument("--webhook_url", type=str, default="", help="Webhook URL to call on completion")
+    parser.add_argument("--job_id", type=str, default="", help="Job ID for tracking")
+    parser.add_argument("--user_id", type=str, default="", help="User ID for tracking")
+    parser.add_argument("--model_id", type=str, default="", help="Model ID for tracking")
+    parser.add_argument("--trigger_word", type=str, default="ohwx", help="Trigger word used in training")
+    parser.add_argument("--steps", type=int, default=1500, help="Training steps")
 
     #These arguments can be left as default
     parser.add_argument("--zip_path", type=str, default="Dataset/dataset.zip")
@@ -202,15 +445,98 @@ def main() -> None:
     # flux_train_script = script_dir / ".." / "kohya_ss" / "sd-scripts" / "flux_train_network.py"
 
     flux_train_script = "kohya_ss/sd-scripts/flux_train_network.py"
-    run([
-        "accelerate", "launch",
-        "--num_machines", "1",
-        "--num_processes", "1",
-        "--mixed_precision", "bf16",
-        "--dynamo_backend", "no",
-        str(flux_train_script),
-        "--config_file", str(resolved_path),
-    ])    
+    
+    # Track training success/failure for webhook
+    training_success = False
+    training_error = None
+    
+    try:
+        run_cmd([
+            "accelerate", "launch",
+            "--num_machines", "1",
+            "--num_processes", "1",
+            "--mixed_precision", "bf16",
+            "--dynamo_backend", "no",
+            str(flux_train_script),
+            "--config_file", str(resolved_path),
+        ])
+        training_success = True
+        logging.info("Training completed successfully")
+    except subprocess.CalledProcessError as e:
+        training_error = f"Training failed with exit code {e.returncode}"
+        logging.error(training_error)
+    except Exception as e:
+        training_error = f"Training failed: {str(e)}"
+        logging.error(training_error)
+
+    # ============== R2 Upload ==============
+    lora_url = None
+    uploaded_files = {}
+    
+    if training_success and args.r2_out_key:
+        logging.info("=== Uploading outputs to R2 ===")
+        try:
+            uploaded_files = upload_training_outputs(saves_dir, args.r2_out_key)
+            
+            # Find the main model URL (first .safetensors file)
+            for filename, url in uploaded_files.items():
+                if filename.endswith(".safetensors") and url:
+                    lora_url = url
+                    break
+            
+            if lora_url:
+                logging.info(f"Main LoRA model uploaded: {lora_url}")
+            else:
+                logging.warning("No .safetensors file found in outputs")
+        except Exception as e:
+            logging.error(f"R2 upload failed: {e}")
+    elif not args.r2_out_key:
+        logging.info("No R2 output key specified, skipping R2 upload")
+
+    # ============== Webhook Callback ==============
+    webhook_url = args.webhook_url or os.environ.get("WEBHOOK_URL", "")
+    job_id = args.job_id or os.environ.get("JOB_ID", "")
+    user_id = args.user_id or os.environ.get("USER_ID", "")
+    model_id = args.model_id or os.environ.get("MODEL_ID", "")
+    
+    if webhook_url:
+        logging.info("=== Calling webhook ===")
+        
+        extra_data = {
+            "trigger_word": args.trigger_word,
+            "steps": args.steps,
+            "uploaded_files": {k: v for k, v in uploaded_files.items() if v},
+        }
+        
+        if training_success:
+            call_webhook(
+                webhook_url=webhook_url,
+                status="completed",
+                job_id=job_id,
+                model_id=model_id,
+                user_id=user_id,
+                lora_url=lora_url,
+                extra_data=extra_data,
+            )
+        else:
+            call_webhook(
+                webhook_url=webhook_url,
+                status="failed",
+                job_id=job_id,
+                model_id=model_id,
+                user_id=user_id,
+                error_message=training_error,
+                extra_data=extra_data,
+            )
+    else:
+        logging.info("No webhook URL configured, skipping callback")
+
+    # Exit with appropriate code
+    if not training_success:
+        logging.error("Pipeline failed")
+        exit(1)
+    
+    logging.info("=== Pipeline completed successfully ===")
 
 
 if __name__ == "__main__":
