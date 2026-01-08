@@ -1512,8 +1512,57 @@ class UnionFind:
             if self.rank[root_x] == self.rank[root_y]:
                 self.rank[root_x] += 1
 
-def initialize_sam2_models(device):
-    try:
+
+# =============================================================================
+# MODEL CACHING SYSTEM
+# =============================================================================
+
+class ModelCache:
+    """
+    Thread-safe cache for loaded models to avoid redundant loading.
+    Useful when processing multiple batches or when models are reused.
+    """
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._models = {}
+                    cls._instance._model_lock = threading.Lock()
+        return cls._instance
+    
+    def get_or_load(self, model_key, loader_func):
+        """Get cached model or load it using the provided function."""
+        with self._model_lock:
+            if model_key not in self._models:
+                self._models[model_key] = loader_func()
+            return self._models[model_key]
+    
+    def clear(self, model_key=None):
+        """Clear specific model or all models from cache."""
+        with self._model_lock:
+            if model_key:
+                self._models.pop(model_key, None)
+            else:
+                self._models.clear()
+    
+    def has(self, model_key):
+        """Check if model is cached."""
+        return model_key in self._models
+
+
+# Global model cache instance
+_model_cache = ModelCache()
+
+
+def initialize_sam2_models(device, use_cache=True):
+    """Initialize SAM2 models with optional caching."""
+    cache_key = f"sam2_{device}"
+    
+    def load_models():
         sam2_model = build_sam2(SAM2_MODEL_CONFIG, SAM2_CHECKPOINT, device=device)
         sam2_predictor = SAM2ImagePredictor(sam2_model)
         grounding_model = load_model(
@@ -1525,20 +1574,32 @@ def initialize_sam2_models(device):
             'sam2_predictor': sam2_predictor,
             'grounding_model': grounding_model
         }
+    
+    try:
+        if use_cache:
+            return _model_cache.get_or_load(cache_key, load_models)
+        return load_models()
     except Exception as e:
         raise Exception(f"Failed to initialize SAM2 models: {str(e)}")
 
-def initialize_yolo_models(model_dir, device, selected_class="yolov11l-face.pt"):
-    try:
-        # Use specific face model if selected
+
+def initialize_yolo_models(model_dir, device, selected_class="yolov11l-face.pt", use_cache=True):
+    """Initialize YOLO models with optional caching."""
+    cache_key = f"yolo_{device}_{selected_class}"
+    
+    def load_models():
         if selected_class == "yolov11l-face.pt":
             model_path = os.path.join(model_dir, "yolov11l-face.pt")
-            model = YOLO(model_path)
         else:
             model_path = os.path.join(model_dir, "yolo11x.pt")
-            model = YOLO(model_path)
+        model = YOLO(model_path)
         model.to(device)
         return {'yolo_model': model}
+    
+    try:
+        if use_cache:
+            return _model_cache.get_or_load(cache_key, load_models)
+        return load_models()
     except Exception as e:
         raise Exception(f"Failed to initialize YOLO model: {str(e)}")
 
@@ -1731,6 +1792,528 @@ def cancel_duplicates_handler():
     processing_state.stop_processing()
     time.sleep(1)
     return "⚠️ Duplicate detection cancelled."
+
+
+# =============================================================================
+# OPTIMIZED UNIFIED CROP AND RESIZE FUNCTIONALITY
+# =============================================================================
+
+def process_image_unified(args):
+    """
+    Unified image processing: detects subject once, then crops AND resizes in a single pass.
+    This avoids redundant I/O and detection by:
+    1. Loading image once
+    2. Running detection once
+    3. Cropping to all aspect ratios
+    4. Optionally resizing each crop to target resolutions
+    """
+    (filename, input_folder, output_folder, aspect_ratios, target_resolutions,
+     yolo_folder, save_yolo, overwrite, selected_class, save_as_png, sam2_prompt,
+     model, sam2_predictor, grounding_model, debug_mode, skip_no_detection,
+     padding_value, padding_unit) = args
+    
+    debug = debug_mode
+    
+    def parse_aspect_ratios(aspect_ratios):
+        try:
+            if isinstance(aspect_ratios, list) and all(isinstance(x, tuple) for x in aspect_ratios):
+                return aspect_ratios
+            if isinstance(aspect_ratios, str):
+                return [tuple(map(int, ar.strip().split('x'))) for ar in aspect_ratios.split(',')]
+            if isinstance(aspect_ratios, list) and all(isinstance(x, str) for x in aspect_ratios):
+                return [tuple(map(int, ar.strip().split('x'))) for ar in aspect_ratios]
+            raise ValueError(f"Invalid aspect_ratios format: {aspect_ratios}")
+        except Exception as e:
+            raise ValueError(f"Failed to parse aspect ratios: {str(e)}")
+
+    def parse_resolutions(resolutions):
+        """Parse target resolutions from string or list format"""
+        if not resolutions:
+            return None
+        try:
+            if isinstance(resolutions, list) and all(isinstance(x, tuple) for x in resolutions):
+                return resolutions
+            if isinstance(resolutions, str):
+                return [tuple(map(int, r.strip().split('x'))) for r in resolutions.split(',')]
+            return None
+        except Exception:
+            return None
+
+    try:
+        img_path = os.path.join(input_folder, filename)
+        
+        if debug:
+            logging.critical(f"\n=== Unified Processing {filename} ===")
+        
+        # Load image once
+        img_array = cv2.imread(img_path)
+        if img_array is None:
+            raise ValueError(f"Could not read image {img_path}")
+        
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+        
+        # Handle format conversion once
+        if not save_as_png:
+            with Image.open(img_path) as original_pil:
+                if original_pil.mode in ('RGBA', 'LA', 'P'):
+                    background = Image.new('RGB', original_pil.size, (255, 255, 255))
+                    if original_pil.mode == 'P':
+                        original_pil = original_pil.convert('RGBA')
+                    background.paste(original_pil, mask=original_pil.split()[-1] if original_pil.mode in ('RGBA', 'LA') else None)
+                    pil_img = background
+                else:
+                    pil_img = original_pil.convert('RGB')
+                
+                jpg_buffer = BytesIO()
+                pil_img.save(jpg_buffer, format='JPEG', quality=100)
+                jpg_buffer.seek(0)
+                pil_img_jpg = Image.open(jpg_buffer)
+                img_array = np.array(pil_img_jpg)
+        
+        original_height, original_width = img_array.shape[:2]
+        
+        if debug:
+            logging.critical(f"Image size: {original_width}x{original_height}")
+
+        # Run detection ONCE
+        bbox = None
+        segmented_pil = None
+        
+        if sam2_prompt:
+            if debug:
+                logging.critical("Running SAM2 detection (once)")
+            
+            segmented_image, mask_image, mask_coordinates, _, _ = sam2_process_image(
+                img_array, sam2_prompt, 0.35, 0.25, True,
+                sam2_predictor, grounding_model,
+                None, yolo_folder, None, None, None, img_path
+            )
+            
+            segmented_pil = Image.fromarray(segmented_image)
+            
+            if mask_coordinates and len(mask_coordinates) > 0:
+                try:
+                    x_coords = [p[1] for p in mask_coordinates if len(p) >= 2]
+                    y_coords = [p[0] for p in mask_coordinates if len(p) >= 2]
+                except (IndexError, TypeError):
+                    if skip_no_detection:
+                        return f"Skipped {filename} (invalid coordinates)", 0, 0
+                    return f"Invalid coordinates for {filename}", 0, 1
+                
+                if len(x_coords) == 0 or len(y_coords) == 0:
+                    if skip_no_detection:
+                        return f"Skipped {filename} (no valid coordinates)", 0, 0
+                    return f"No valid coordinates for {filename}", 0, 1
+                
+                bbox = [int(min(x_coords)), int(min(y_coords)), int(max(x_coords)), int(max(y_coords))]
+                bbox[0] = max(0, bbox[0])
+                bbox[1] = max(0, bbox[1])
+                bbox[2] = min(original_width, bbox[2])
+                bbox[3] = min(original_height, bbox[3])
+            else:
+                if skip_no_detection:
+                    return f"Skipped {filename} (no SAM2 detection)", 0, 0
+                return f"No segmentation found for {filename}", 0, 1
+        else:
+            if debug:
+                logging.critical("Running YOLO detection (once)")
+            
+            results = model(img_array)
+            detections = results[0].boxes
+            
+            class_detections = [box for box in detections if model.names[int(box.cls)] == selected_class]
+            
+            if not class_detections and detections is not None and len(detections) > 0:
+                face_classes = [box for box in detections if 'face' in model.names[int(box.cls)].lower()]
+                if face_classes:
+                    class_detections = face_classes
+                elif 'face' in selected_class.lower():
+                    class_detections = [detections[0]]
+            
+            if class_detections:
+                bbox = [int(x) for x in class_detections[0].xyxy[0].tolist()]
+                if debug:
+                    logging.critical(f"YOLO bbox: {bbox}")
+            else:
+                if skip_no_detection:
+                    return f"Skipped {filename} (no {selected_class} detected)", 0, 0
+                return f"No {selected_class} detected in {filename}", 0, 1
+
+        # Parse aspect ratios and resolutions
+        parsed_aspect_ratios = parse_aspect_ratios(aspect_ratios)
+        parsed_resolutions = parse_resolutions(target_resolutions)
+        
+        img = Image.fromarray(img_array)
+        processed = 0
+        skipped = 0
+        
+        # Process all aspect ratios using the single detection result
+        for target_width, target_height in parsed_aspect_ratios:
+            if target_width <= 0 or target_height <= 0:
+                continue
+            
+            # Calculate crop bbox for this aspect ratio
+            final_bbox = resize_bbox_to_dimensions(
+                bbox, target_width, target_height, original_width, original_height,
+                False, padding_value, padding_unit
+            )
+            
+            if not final_bbox or len(final_bbox) != 4:
+                final_bbox = list(bbox)
+            
+            final_bbox = [
+                max(0, int(final_bbox[0])),
+                max(0, int(final_bbox[1])),
+                min(original_width, int(final_bbox[2])),
+                min(original_height, int(final_bbox[3]))
+            ]
+            
+            if final_bbox[2] <= final_bbox[0] or final_bbox[3] <= final_bbox[1]:
+                continue
+            
+            try:
+                cropped_img = img.crop(final_bbox)
+            except Exception:
+                continue
+            
+            # Save crop to aspect ratio folder
+            aspect_folder = os.path.join(output_folder, f"{target_width}x{target_height}")
+            os.makedirs(aspect_folder, exist_ok=True)
+            
+            base_name = os.path.splitext(filename)[0]
+            extension = '.png' if save_as_png else '.jpg'
+            crop_save_path = os.path.join(aspect_folder, base_name + extension)
+            
+            if not overwrite and os.path.exists(crop_save_path):
+                skipped += 1
+                continue
+            
+            try:
+                if save_as_png:
+                    cropped_img.save(crop_save_path, 'PNG')
+                else:
+                    cropped_img.save(crop_save_path, 'JPEG', quality=100)
+                processed += 1
+            except Exception:
+                skipped += 1
+                continue
+            
+            # If resolutions specified, resize the crop immediately
+            if parsed_resolutions:
+                for res_width, res_height in parsed_resolutions:
+                    # Only resize if the resolution matches this aspect ratio
+                    target_aspect = target_width / target_height
+                    res_aspect = res_width / res_height
+                    
+                    # Allow small tolerance for aspect ratio matching
+                    if abs(target_aspect - res_aspect) < 0.01:
+                        resized_img = cropped_img.resize((res_width, res_height), Image.LANCZOS)
+                        
+                        resize_folder = os.path.join(output_folder, f"{res_width}x{res_height}_resized")
+                        os.makedirs(resize_folder, exist_ok=True)
+                        
+                        resize_save_path = os.path.join(resize_folder, base_name + extension)
+                        
+                        if not overwrite and os.path.exists(resize_save_path):
+                            continue
+                        
+                        try:
+                            if save_as_png:
+                                resized_img.save(resize_save_path, 'PNG')
+                            else:
+                                resized_img.save(resize_save_path, 'JPEG', quality=100)
+                            processed += 1
+                        except Exception:
+                            pass
+
+        # Save YOLO/SAM2 visualization if requested
+        if save_yolo and yolo_folder:
+            yolo_save_path = os.path.join(yolo_folder, os.path.splitext(filename)[0] + ('.png' if save_as_png else '.jpg'))
+            try:
+                if sam2_prompt and segmented_pil:
+                    segmented_pil.save(yolo_save_path, format='PNG' if save_as_png else 'JPEG', quality=100)
+                elif not sam2_prompt:
+                    result_img = Image.fromarray(results[0].plot())
+                    result_img.save(yolo_save_path, format='PNG' if save_as_png else 'JPEG', quality=100)
+                processed += 1
+            except Exception:
+                skipped += 1
+
+        return f"Processed {filename}", processed, skipped
+
+    except Exception as e:
+        if debug:
+            logging.critical(f"Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        return f"Error processing {filename}: {str(e)}", 0, 1
+
+
+def worker_process_unified(gpu_id, worker_id, tasks, input_folder, output_folder, yolo_folder,
+                           aspect_ratios, target_resolutions, save_yolo, overwrite, selected_class,
+                           save_as_png, sam2_prompt, results_queue, processed_files_queue,
+                           processed_count, stop_processing, status_queue, big_lock,
+                           debug_mode, skip_no_detection, padding_value, padding_unit, model_dir):
+    """
+    Worker process for unified crop+resize operation.
+    Initializes models once and processes multiple images.
+    """
+    try:
+        global debug
+        debug = debug_mode
+        
+        device = f"cuda:{gpu_id}"
+        status_queue.put(f"Worker {worker_id} starting on GPU {gpu_id}")
+
+        # Initialize models once per worker
+        try:
+            if sam2_prompt:
+                models = initialize_sam2_models(device)
+                model = None
+                sam2_predictor = models['sam2_predictor']
+                grounding_model = models['grounding_model']
+            else:
+                models = initialize_yolo_models(model_dir, device, selected_class)
+                model = models['yolo_model']
+                sam2_predictor = None
+                grounding_model = None
+        except Exception as e:
+            status_queue.put(f"ERROR:Failed to initialize models on GPU {gpu_id}: {str(e)}")
+            return
+
+        total_tasks = len(tasks)
+        start_time = time.time()
+        worker_processed = 0
+
+        for task_idx, image_file in enumerate(tasks, 1):
+            if stop_processing.value:
+                status_queue.put(f"STOPPED:Worker {worker_id} on GPU {gpu_id} stopping")
+                return
+
+            try:
+                result = process_image_unified((
+                    image_file, input_folder, output_folder, aspect_ratios, target_resolutions,
+                    yolo_folder, save_yolo, overwrite, selected_class, save_as_png, sam2_prompt,
+                    model, sam2_predictor, grounding_model, debug_mode, skip_no_detection,
+                    padding_value, padding_unit
+                ))
+
+                with big_lock:
+                    processed_count.value += 1
+                    worker_processed += 1
+
+                    elapsed_time = time.time() - start_time
+                    current_speed = task_idx / elapsed_time if elapsed_time > 0 else 0
+                    eta = (total_tasks - task_idx) / current_speed if current_speed > 0 else 0
+
+                    status_msg = (
+                        f"PROGRESS:Worker {worker_id} | "
+                        f"GPU {gpu_id} | "
+                        f"Processed: {worker_processed}/{total_tasks} | "
+                        f"Speed: {current_speed:.2f} img/s | "
+                        f"ETA: {eta:.1f}s | "
+                        f"Current: {image_file}"
+                    )
+                    status_queue.put(status_msg)
+                    results_queue.put(result)
+                    processed_files_queue.put(image_file)
+
+            except Exception as e:
+                if not stop_processing.value:
+                    status_queue.put(f"ERROR:Error processing {image_file} on GPU {gpu_id}: {str(e)}")
+
+    except Exception as e:
+        if not stop_processing.value:
+            status_queue.put(f"ERROR:Critical error in worker {worker_id} on GPU {gpu_id}: {str(e)}")
+
+
+def crop_and_resize(input_folder, output_folder, aspect_ratios, target_resolutions=None,
+                    yolo_folder=None, save_yolo=False, batch_size=1, gpu_ids="0",
+                    overwrite=False, selected_class="person", save_as_png=False,
+                    sam2_prompt="", debug_mode=False, skip_no_detection=False,
+                    padding_value=0, padding_unit="percent", model_dir="models"):
+    """
+    Unified crop and resize function - performs both operations in a single pass.
+    
+    This is more efficient than running crop_images followed by resize_images because:
+    1. Images are loaded only once
+    2. Detection (YOLO/SAM2) runs only once per image
+    3. Cropped images are resized immediately without additional I/O
+    4. Memory is used more efficiently
+    
+    Args:
+        input_folder: Input folder with raw images
+        output_folder: Output folder for cropped (and optionally resized) images
+        aspect_ratios: Comma-separated aspect ratios (e.g., "3x4,4x5,1x1")
+        target_resolutions: Optional comma-separated target resolutions (e.g., "1024x1024,768x1024")
+                           If provided, crops will be resized to matching aspect ratio resolutions
+        ... (other args same as crop_images)
+    """
+    try:
+        global debug
+        debug = debug_mode
+        
+        manager = Manager()
+        processing_state.set_manager(manager)
+        stop_processing = manager.Value('b', False)
+        processing_state.set_stop_flag(stop_processing)
+        
+        results_queue = manager.Queue()
+        processed_files_queue = manager.Queue()
+        processed_count = manager.Value('i', 0)
+        status_queue = manager.Queue()
+        big_lock = manager.Lock()
+
+        image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(img_formats)]
+        
+        filtered_files, skipped_files = filter_existing_files(
+            image_files, output_folder, aspect_ratios, save_yolo, yolo_folder, save_as_png, overwrite
+        )
+        
+        if skipped_files:
+            yield f"Skipping {len(skipped_files)} existing files"
+        
+        if not filtered_files:
+            yield "No new files to process. All files already exist."
+            return
+            
+        yield f"Processing {len(filtered_files)} files (unified crop+resize)..."
+        
+        gpu_ids_list = [int(x.strip()) for x in gpu_ids.split(',')]
+        tasks_per_gpu = distribute_tasks(filtered_files, gpu_ids_list, batch_size)
+
+        processes = []
+        
+        try:
+            for gpu_index, gpu_id in enumerate(gpu_ids_list):
+                for worker_index, tasks in enumerate(tasks_per_gpu[gpu_index]):
+                    if not tasks:
+                        continue
+                    worker_id = gpu_index * batch_size + worker_index
+                    p = Process(
+                        target=worker_process_unified,
+                        args=(
+                            gpu_id, worker_id, tasks, input_folder, output_folder,
+                            yolo_folder, aspect_ratios, target_resolutions, save_yolo, overwrite,
+                            selected_class, save_as_png, sam2_prompt, results_queue,
+                            processed_files_queue, processed_count, stop_processing,
+                            status_queue, big_lock, debug_mode, skip_no_detection,
+                            padding_value, padding_unit, model_dir
+                        )
+                    )
+                    p.start()
+                    processes.append(p)
+
+            total_files = len(filtered_files)
+            while processed_count.value < total_files and any(p.is_alive() for p in processes):
+                if stop_processing.value:
+                    for p in processes:
+                        p.join(timeout=5)
+                    yield "Processing stopped by user"
+                    break
+                
+                try:
+                    status = status_queue.get(timeout=1)
+                    yield status
+                except queue.Empty:
+                    continue
+
+            yield f"Completed unified processing of {processed_count.value}/{total_files} images"
+
+        finally:
+            stop_processing.value = True
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+                p.join(timeout=1)
+            manager.shutdown()
+
+    except Exception as e:
+        yield f"Error: {str(e)}"
+
+
+def resize_cropped_images_optimized(input_folder, output_folder, resolutions, save_as_png=False,
+                                    num_threads=4, overwrite=False, use_lanczos=True):
+    """
+    Optimized resize function that works on already-cropped images.
+    Uses ThreadPoolExecutor for I/O-bound operations and batch processing.
+    """
+    resolutions = [tuple(map(int, res.strip().split('x'))) for res in resolutions.split(',')]
+    
+    image_paths = []
+    for resolution in resolutions:
+        resolution_folder = os.path.join(input_folder, f"{resolution[0]}x{resolution[1]}")
+        if os.path.exists(resolution_folder):
+            resolution_images = [
+                os.path.join(resolution_folder, fname)
+                for fname in os.listdir(resolution_folder)
+                if fname.lower().endswith(img_formats)
+            ]
+            image_paths.extend([(p, resolution) for p in resolution_images])
+    
+    if not image_paths:
+        yield "No images found to resize."
+        return
+    
+    total_images = len(image_paths)
+    yield f"Found {total_images} images to resize"
+    
+    processing_state.reset()
+    processed_count = 0
+    start_time = time.time()
+    
+    resampling = Image.LANCZOS if use_lanczos else Image.BILINEAR
+    
+    def resize_single(args):
+        path, target_res = args
+        try:
+            with Image.open(path) as img:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                resized = img.resize(target_res, resampling)
+                
+                subfolder = f"{target_res[0]}x{target_res[1]}"
+                out_folder = os.path.join(output_folder, subfolder)
+                os.makedirs(out_folder, exist_ok=True)
+                
+                base_name = os.path.splitext(os.path.basename(path))[0]
+                ext = '.png' if save_as_png else '.jpg'
+                out_path = os.path.join(out_folder, base_name + ext)
+                
+                if not overwrite and os.path.exists(out_path):
+                    return 0, 1
+                
+                if save_as_png:
+                    resized.save(out_path, 'PNG')
+                else:
+                    resized.save(out_path, 'JPEG', quality=100)
+                
+                return 1, 0
+        except Exception:
+            return 0, 1
+    
+    with ProcessPoolExecutor(max_workers=num_threads) as executor:
+        processing_state.set_executor(executor)
+        futures = [executor.submit(resize_single, args) for args in image_paths]
+        
+        for future in as_completed(futures):
+            if processing_state.is_cancelled():
+                yield "Resize cancelled."
+                break
+            
+            proc, skip = future.result()
+            processed_count += proc
+            
+            elapsed = time.time() - start_time
+            speed = processed_count / elapsed if elapsed > 0 else 0
+            eta = (total_images - processed_count) / speed if speed > 0 else 0
+            
+            yield f"Resized: {processed_count}/{total_images} | Speed: {speed:.2f}/s | ETA: {eta:.1f}s"
+    
+    total_time = time.time() - start_time
+    yield f"Resize complete! {processed_count}/{total_images} in {time.strftime('%H:%M:%S', time.gmtime(total_time))}"
+
 
 # def process_single_image_process(image_path, input_folder, output_folder, yolo_folder, 
 #                                  aspect_ratios, save_yolo, overwrite, selected_class,
@@ -2134,6 +2717,35 @@ def main():
     p_faces.add_argument("--gpu-id", type=int, default=0, help="GPU id for SAM2 model (if used)")
     p_faces.add_argument("--debug", action="store_true", help="Enable verbose logging")
 
+    # --- crop-resize (UNIFIED - OPTIMIZED) ---
+    p_unified = sub.add_parser("crop-resize", help="[OPTIMIZED] Crop AND resize images in a single pass - more efficient than running crop then resize separately")
+    p_unified.add_argument("--input", required=True, help="Input folder with raw images")
+    p_unified.add_argument("--output", required=True, help="Output folder for cropped and resized images")
+    p_unified.add_argument("--aspect-ratios", default="1x1", help="Comma-separated aspect ratios, e.g. 3x4,4x5,1x1")
+    p_unified.add_argument("--resolutions", default="", help="Optional comma-separated target resolutions, e.g. 1024x1024,768x1024. Images are resized to matching aspect ratios.")
+    p_unified.add_argument("--yolo-folder", default="", help="Folder to save YOLO/SAM2 visualizations (optional)")
+    p_unified.add_argument("--save-yolo", action="store_true", help="Save YOLO/SAM2 outputs to --yolo-folder")
+    p_unified.add_argument("--batch-size", type=int, default=1, help="Workers per GPU")
+    p_unified.add_argument("--gpu-ids", default="0", help="Comma-separated GPU ids, e.g. 0 or 0,1")
+    p_unified.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    p_unified.add_argument("--class", dest="selected_class", default="person", help="YOLO class (default: person)")
+    p_unified.add_argument("--png", action="store_true", help="Save outputs as PNG (default is JPG)")
+    p_unified.add_argument("--sam2-prompt", default="", help="If set, use SAM2 segmenter prompt")
+    p_unified.add_argument("--debug", action="store_true", help="Enable verbose logging")
+    p_unified.add_argument("--skip-no-detection", action="store_true", help="Skip images with no detection")
+    p_unified.add_argument("--padding-value", type=float, default=0.0, help="Extra padding around detected box")
+    p_unified.add_argument("--padding-unit", choices=["percent", "pixels"], default="percent", help="Padding unit")
+
+    # --- resize-fast (OPTIMIZED) ---
+    p_resize_fast = sub.add_parser("resize-fast", help="[OPTIMIZED] Fast resize for already-cropped images")
+    p_resize_fast.add_argument("--input", required=True, help="Input folder with cropped images (expects subfolders like 3x4/, 1x1/)")
+    p_resize_fast.add_argument("--output", required=True, help="Output folder root")
+    p_resize_fast.add_argument("--resolutions", default="1024x1024", help="Comma-separated target resolutions")
+    p_resize_fast.add_argument("--png", action="store_true", help="Save as PNG")
+    p_resize_fast.add_argument("--threads", type=int, default=4, help="Number of worker threads")
+    p_resize_fast.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    p_resize_fast.add_argument("--bilinear", action="store_true", help="Use bilinear (faster) instead of LANCZOS (better quality)")
+
     args = parser.parse_args()
 
     if args.cmd == "crop":
@@ -2200,6 +2812,45 @@ def main():
             args.gpu_id,
             args.debug,
             model_dir=args.model_dir,
+        )
+        _print_generator(gen)
+        return
+
+    if args.cmd == "crop-resize":
+        debug = bool(args.debug)
+        if args.save_yolo and not args.yolo_folder:
+            raise SystemExit("--save-yolo requires --yolo-folder")
+        gen = crop_and_resize(
+            args.input,
+            args.output,
+            args.aspect_ratios,
+            target_resolutions=args.resolutions if args.resolutions else None,
+            yolo_folder=args.yolo_folder if args.yolo_folder else None,
+            save_yolo=args.save_yolo,
+            batch_size=args.batch_size,
+            gpu_ids=args.gpu_ids,
+            overwrite=args.overwrite,
+            selected_class=args.selected_class,
+            save_as_png=args.png,
+            sam2_prompt=args.sam2_prompt,
+            debug_mode=args.debug,
+            skip_no_detection=args.skip_no_detection,
+            padding_value=args.padding_value,
+            padding_unit=args.padding_unit,
+            model_dir=args.model_dir,
+        )
+        _print_generator(gen)
+        return
+
+    if args.cmd == "resize-fast":
+        gen = resize_cropped_images_optimized(
+            args.input,
+            args.output,
+            args.resolutions,
+            save_as_png=args.png,
+            num_threads=args.threads,
+            overwrite=args.overwrite,
+            use_lanczos=not args.bilinear,
         )
         _print_generator(gen)
         return
