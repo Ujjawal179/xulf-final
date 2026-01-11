@@ -2,7 +2,7 @@ import os
 import cv2
 import shutil
 import time
-from PIL import Image, ExifTags
+from PIL import Image, ExifTags, ImageOps
 from ultralytics import YOLO
 import imagehash
 import threading
@@ -384,7 +384,7 @@ def crop_images(input_folder, output_folder, aspect_ratios, yolo_folder, save_yo
                     p.start()
                     processes.append(p)
 
-            total_files = len(image_files)
+            total_files = len(filtered_files)
             while processed_count.value < total_files and any(p.is_alive() for p in processes):
                 if stop_processing.value:
                     # Wait for processes to finish current tasks (5sec)
@@ -523,17 +523,19 @@ def process_image(args):
             if debug:
                 logging.critical(f"\n=== Processing {filename} ===")
             
-            img_array = cv2.imread(img_path)
-            if img_array is None:
+            # Read image via PIL and apply EXIF orientation (many phone images rely on this)
+            with Image.open(img_path) as _im_raw:
+                _im = ImageOps.exif_transpose(_im_raw).convert('RGB')
+                img_array = np.array(_im)
+
+            if img_array is None or img_array.size == 0:
                 raise ValueError(f"Could not read image {img_path}")
-            
-            img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
-            
             if not save_as_png:
                 if debug:
                     logging.critical(f"Converting {filename} to JPG format before processing")
                 
-                with Image.open(img_path) as original_pil:
+                with Image.open(img_path) as original_pil_raw:
+                    original_pil = ImageOps.exif_transpose(original_pil_raw).copy()
                     if original_pil.mode in ('RGBA', 'LA', 'P'):
                         background = Image.new('RGB', original_pil.size, (255, 255, 255))
                         if original_pil.mode == 'P':
@@ -549,7 +551,7 @@ def process_image(args):
                     jpg_buffer.seek(0)
                     
                     # Reload the temp JPG
-                    pil_img_jpg = Image.open(jpg_buffer)
+                    pil_img_jpg = Image.open(jpg_buffer).convert('RGB')
                     img_array = np.array(pil_img_jpg)
                 
                 if debug:
@@ -627,8 +629,14 @@ def process_image(args):
                         logging.critical("No mask coordinates found")
                     if skip_no_detection:
                         return f"Skipped {filename} (no SAM2 detection)", 0, 0
-                    else:
-                        return f"No segmentation found for {filename}", 0, 1
+
+                    # Fallback (keep image count stable):
+                    # If SAM2 fails to return a mask and the caller did NOT ask to skip,
+                    # use the full image as the crop bbox so downstream steps still get an output.
+                    bbox = [0, 0, original_width, original_height]
+                    segmented_pil = Image.fromarray(img_array)
+                    print(f"FALLBACK: no SAM2 mask for {filename}; using full-image bbox {bbox}")
+                    logging.critical(f"FALLBACK: no SAM2 mask for {filename}; using full-image bbox {bbox}")
 
             else:
                 if debug:
@@ -663,10 +671,33 @@ def process_image(args):
                         logging.critical(f"12. Original YOLO bbox: {bbox}")
                         draw_debug_bbox(img_array, bbox, f"viz_yolo_bbox_{filename}")
                 else:
-                    print(f"NO '{selected_class.upper()}' CLASS FOUND IN DETECTIONS")
-                    if debug:
-                        logging.critical(f"No {selected_class} detected")
-                    return f"No {selected_class} detected in {filename}", 0, 1
+                    print(f"NO '{selected_class.upper()}' CLASS FOUND IN DETECTIONS for {filename}")
+                    logging.critical(f"NO '{selected_class.upper()}' CLASS FOUND IN DETECTIONS for {filename}")
+
+                    if skip_no_detection:
+                        if debug:
+                            logging.critical(f"No {selected_class} detected")
+                        return f"No {selected_class} detected in {filename}", 0, 1
+
+                    # Retry once with a lower confidence threshold to reduce false negatives
+                    # (only triggered on failures, so the common-case runtime is unaffected).
+                    try:
+                        results_retry = model(img_array, conf=0.10)
+                        detections_retry = results_retry[0].boxes
+                        class_detections_retry = [box for box in detections_retry if model.names[int(box.cls)] == selected_class] if detections_retry is not None else []
+                        if class_detections_retry:
+                            results = results_retry
+                            detections = detections_retry
+                            bbox = [int(x) for x in class_detections_retry[0].xyxy[0].tolist()]
+                            print(f"YOLO RETRY DETECTION FOUND: {bbox} for class '{selected_class}' in {filename}")
+                            logging.critical(f"YOLO RETRY DETECTION FOUND: {bbox} for class '{selected_class}' in {filename}")
+                        else:
+                            raise ValueError("retry did not find target class")
+                    except Exception:
+                        # Final fallback: keep the image in the dataset by using the full-image bbox.
+                        bbox = [0, 0, original_width, original_height]
+                        print(f"FALLBACK: no '{selected_class}' detection for {filename}; using full-image bbox {bbox}")
+                        logging.critical(f"FALLBACK: no '{selected_class}' detection for {filename}; using full-image bbox {bbox}")
 
             processed = 0
             skipped = 0
